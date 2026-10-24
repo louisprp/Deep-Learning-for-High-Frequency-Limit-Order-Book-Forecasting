@@ -1,0 +1,16 @@
+[project]
+name = "btc-lob-benchmark"
+version = "0.1.0"
+description = "Benchmark of six limit-order-book models on BTCUSDT perpetual snapshots"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "louisprp" }]
+dependencies = [
+  "numpy>=2.1",
+  "pandas>=2.2",
+  "scikit-learn>=1.5",
+  "scipy>=1.14",
+  "matplotlib>=3.9",
+  "torch>=2.5,<2.9",
+  "jupyter>=1.1",
+]

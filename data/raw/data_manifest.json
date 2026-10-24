@@ -1,0 +1,11 @@
+{
+  "dataset_url": "https://www.kaggle.com/datasets/siavashraz/bitcoin-perpetualbtcusdtp-limit-order-book-data",
+  "downloaded_at_utc": "2026-08-01T19:05:55.533443+00:00",
+  "files": [
+    {
+      "bytes": 1195785420,
+      "name": "1-09-1-20.csv",
+      "sha256": "5d3f14a2d252a884e3c9b81a6f3767c7161296ecc8fdd1280c7d46a1cea19847"
+    }
+  ]
+}
