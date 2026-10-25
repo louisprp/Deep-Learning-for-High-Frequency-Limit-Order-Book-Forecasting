@@ -152,6 +152,87 @@ class TLOB(nn.Module):
         return self.classifier(x.transpose(1, 2).flatten(1))
 
 
+class SpatialBlock(nn.Module):
+    def __init__(self, width, dilation, dropout):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.GroupNorm(1, width), nn.GELU(),
+            nn.ZeroPad2d((1, 1, 2 * dilation, 0)),  # causal in time, symmetric over levels
+            nn.Conv2d(width, width, 3, dilation=(dilation, 1), groups=width),
+            nn.Conv2d(width, width, 1), nn.Dropout2d(dropout),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class TemporalBlock(nn.Module):
+    def __init__(self, width, dilation, dropout):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.GroupNorm(1, width), nn.GELU(),
+            nn.ConstantPad1d((2 * dilation, 0), 0.0),
+            nn.Conv1d(width, width, 3, dilation=dilation, groups=width),
+            nn.Conv1d(width, width * 2, 1), nn.GLU(dim=1), nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class SideEncoder(nn.Module):
+    def __init__(self, spatial_width, temporal_width, dropout):
+        super().__init__()
+        self.input = nn.Linear(5, spatial_width)
+        self.level_position = nn.Parameter(torch.randn(1, 1, 10, spatial_width) * 0.01)
+        self.blocks = nn.Sequential(SpatialBlock(spatial_width, 1, dropout), SpatialBlock(spatial_width, 2, dropout))
+        self.output = nn.Linear(10 * spatial_width, temporal_width)
+
+    def forward(self, side):
+        x = self.input(side) + self.level_position
+        x = self.blocks(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        return self.output(x.flatten(2))
+
+
+class SymmetricLOB(nn.Module):
+    def __init__(self, spatial_width=24, temporal_width=96, dropout=0.1, horizons=4):
+        super().__init__()
+        # how each column after the two sides moves under the bid/ask mirror: mid change, spread, then the "context" EWMAs (6 signed, 6 unsigned)
+        self.register_buffer("global_signs", torch.tensor((-1.0, 1.0) + (-1.0,) * 6 + (1.0,) * 6), persistent=False)
+        self.side_encoder = SideEncoder(spatial_width, temporal_width, dropout)
+        self.fusion = nn.Sequential(nn.Linear(temporal_width * 4 + len(self.global_signs), temporal_width), nn.GELU(), nn.LayerNorm(temporal_width))
+        self.temporal = nn.Sequential(*(TemporalBlock(temporal_width, dilation, dropout) for dilation in (1, 2, 4, 8, 16, 32)))
+        self.horizon_query = nn.Parameter(torch.randn(horizons, temporal_width) * 0.02)
+        self.horizon_decoder = nn.GRU(temporal_width * 2, temporal_width, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(temporal_width * 2, temporal_width), nn.GELU(), nn.Dropout(dropout), nn.Linear(temporal_width, 4))
+
+    @staticmethod
+    def _side(x, price, volume, flow):
+        state = torch.stack((x[..., price], x[..., volume]), dim=-1)
+        delta = torch.diff(state, dim=1, prepend=state[:, :1])
+        return torch.cat((state, x[..., flow].unsqueeze(-1), delta), dim=-1)
+
+    def _oriented(self, x):
+        ask = self.side_encoder(self._side(x, slice(0, 10), slice(10, 20), slice(20, 30)))
+        bid = self.side_encoder(self._side(x, slice(30, 40), slice(40, 50), slice(50, 60)))
+        fused = self.fusion(torch.cat((ask, bid, bid - ask, bid * ask, x[..., 60:]), dim=-1))
+        sequence = self.temporal(fused.transpose(1, 2)).transpose(1, 2)
+        scores = torch.einsum("btd,hd->bht", sequence, self.horizon_query) / math.sqrt(sequence.shape[-1])
+        context = torch.einsum("bht,btd->bhd", scores.softmax(-1), sequence)
+        last = sequence[:, -1:, :].expand(-1, len(self.horizon_query), -1)
+        query = self.horizon_query.unsqueeze(0).expand(len(x), -1, -1)
+        decoded, _ = self.horizon_decoder(torch.cat((last, context), dim=-1))
+        output = self.head(torch.cat((decoded, query), dim=-1))
+        return output[..., :3], output[..., 3]
+
+    def forward(self, x):
+        logits, returns = self._oriented(x)
+        mirrored = torch.cat((x[..., 30:60], x[..., :30], x[..., 60:] * self.global_signs), dim=-1)  # swap bid and ask, flip the signed columns
+        reflected_logits, reflected_returns = self._oriented(mirrored)
+        reflected_logits = reflected_logits[..., [2, 1, 0]]
+        return (logits + reflected_logits) / 2, (returns - reflected_returns) / 2
+
+
 class MultiHorizonDeepLOB(nn.Module):
     def __init__(self, hidden_dim=64, horizons=4):
         super().__init__()
@@ -240,6 +321,12 @@ CONFIGS = {
         "build": lambda horizons: SiameseLOB(), "task": "mae", "multi": False, "features": "order_flow", "lookback": 50,
         "optimizer": torch.optim.Adam, "lr": 1e-4, "weight_decay": 1e-3, "batch_size": 256, "max_epochs": 50,
         "monitor": "loss", "patience": 5,
+    },
+    "custom_symmetric_lob": {
+        "build": lambda horizons: SymmetricLOB(horizons=horizons), "task": "joint", "multi": True, "features": "custom+context", "lookback": 128,
+        "optimizer": torch.optim.AdamW, "lr": 3e-4, "ema_decay": 0.999, "batch_size": 512, "max_epochs": 50,
+        "class_weighted": True, "auxiliary_weight": 0.2,
+        "monitor": "loss", "patience": 8, "gradient_clip": 1.0, "plateau_patience": 5,
     },
 }
 CONFIGS = {name: {**DEFAULTS, **config} for name, config in CONFIGS.items()}
